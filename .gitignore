@@ -5,3 +5,15 @@
 /CLAUDE.md
 /docs/LOOP_LOG.md
 /docs/superpowers/
+
+# 本地临时数据：探针二进制、解压物、kernel 编译样本、gguf 取证脚本
+/tmp/
+
+# 上游参考代码（C++ Strata fork 及其 zip），只用来查规范，不入库
+/0.2.13-DFlash2/
+
+# tools/v100 探针的编译产物（源码已入库，产物不入库）
+/tools/v100/nr70
+/tools/v100/attr
+/tools/v100/full70.cu
+/tools/v100/full80.cu

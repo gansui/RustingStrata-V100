@@ -17,9 +17,17 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
-cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13010"] }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading"] }
 ash = "0.38"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# NVRTC 版本与目标架构的编译开关（互斥，只能开一个）：
+#   默认 / --features nvrtc_13  CUDA 13 NVRTC，仅 Ampere 及以上（sm_80+，cp.async 与 int8 tensor core）。
+#   --no-default-features --features nvrtc_12  CUDA 12 NVRTC，额外支持 Volta/Turing 老型号（Tesla V100 的 sm_70）。
+[features]
+default = ["nvrtc_13"]
+nvrtc_13 = ["cudarc/cuda-13010"]
+nvrtc_12 = ["cudarc/cuda-12060"]
 
 [profile.release]
 opt-level = 3

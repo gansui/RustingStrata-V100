@@ -84,7 +84,7 @@ fn source(kv_q8: bool) -> String {
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
-         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n{}",
+         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n#define NVRTC_12 {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -95,6 +95,7 @@ fn source(kv_q8: bool) -> String {
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         llama_numerics() as u8,
         kv_q8 as u8,
+        cfg!(feature = "nvrtc_12") as u8,
         include_str!("kernels.cu"),
     )
 }
@@ -115,7 +116,8 @@ fn ptx(src: &str, arch: &'static str) -> anyhow::Result<Ptx> {
     }
     // cudarc panics on a missing library; "CUDA init" lets `backend::open` fall back to Vulkan.
     if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-        return Err(anyhow::anyhow!("the CUDA 13 NVRTC library (libnvrtc.so) is not installed")).context("CUDA init");
+        let ver = if cfg!(feature = "nvrtc_12") { "CUDA 12" } else { "CUDA 13" };
+        return Err(anyhow::anyhow!("the {ver} NVRTC library (libnvrtc.so) is not installed")).context("CUDA init");
     }
     prune_ptx(&dir, std::time::Duration::from_secs(7 * 86400));
     eprintln!("compiling CUDA kernels for {arch} (first run only, ~15 s)");
@@ -124,12 +126,40 @@ fn ptx(src: &str, arch: &'static str) -> anyhow::Result<Ptx> {
     Ok(Ptx::from_binary(b))
 }
 
+/// `nvrtc_12` 的 kernels 用 wmma（Volta tensor core），需要 CUDA 的 `mma.h`。NVRTC 默认没有 include 搜索目录，必须显式
+/// 给出 CUDA 的 include 目录（`STRATA_CUDA_INCLUDE` 优先，否则扫描 `/usr/local/cuda*`）。默认 `nvrtc_13` 路径全自包含、
+/// 只用手写 asm，不需要任何头，返回空。
+fn nvrtc_includes() -> Vec<String> {
+    if !cfg!(feature = "nvrtc_12") { return Vec::new(); }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut add = |d: std::path::PathBuf| {
+        if d.join("mma.h").is_file() && seen.insert(d.display().to_string()) {
+            out.push(format!("-I{}", d.display()));
+        }
+    };
+    if let Some(v) = std::env::var_os("STRATA_CUDA_INCLUDE") { add(v.into()); }
+    if let Ok(rd) = std::fs::read_dir("/usr/local") {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("cuda")) { add(p.join("include")); }
+        }
+    }
+    add(std::path::PathBuf::from("/usr/local/cuda/include"));
+    out
+}
+
 fn cubin(src: &str, arch: &str) -> anyhow::Result<Vec<u8>> {
     use cudarc::nvrtc::{result as nr, sys as ns};
     let c = std::ffi::CString::new(src)?;
     let prog = nr::create_program(&c, None)?;
+    let mut opts = vec![format!("--gpu-architecture={arch}"), "-std=c++17".into()];
+    opts.extend(nvrtc_includes());
+    if cfg!(feature = "nvrtc_12") && opts.len() == 2 {
+        bail!("nvrtc_12 needs the CUDA headers (mma.h) for wmma: set STRATA_CUDA_INCLUDE to the CUDA include directory");
+    }
     let out = (|| unsafe {
-        if let Err(e) = nr::compile_program(prog, &[format!("--gpu-architecture={arch}"), "-std=c++17".into()]) {
+        if let Err(e) = nr::compile_program(prog, opts.as_slice()) {
             let log = nr::get_program_log(prog).map(|l| std::ffi::CStr::from_ptr(l.as_ptr()).to_string_lossy().into_owned());
             bail!("NVRTC compile of kernels.cu failed: {e}\n{}", log.unwrap_or_default());
         }
@@ -179,22 +209,28 @@ impl Gpu {
         let ctx = CudaContext::new(device).context("CUDA init")?;
         unsafe { ctx.disable_event_tracking() };
         eprintln!("cuda device {device}: {}", ctx.name().unwrap_or_default());
-        let stream = ctx.new_stream()?;
-        let (maj, min) = ctx.compute_capability()?;
+        let stream = ctx.new_stream().context("CUDA init: new_stream")?;
+        let (maj, min) = ctx.compute_capability().context("CUDA init: compute_capability")?;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
         let module = ctx.load_module(ptx(&source(kv_q8), arch)?).context("load cubin")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
             .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
-            .chain(QTYPES.iter().filter(|&&t| !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
+            .chain(QTYPES.iter().filter(|&&t| !cfg!(feature = "nvrtc_12") && !Self::float_ty(t)).flat_map(|&t| [kname("gemmi", t), kname("gemmis", t)]))
             .chain([64, 128, 256, 512].iter().flat_map(|h| [format!("attn_decode_{h}"), format!("attn_decode_gqa_{h}")]))
             .chain(["attn_decode_gqa4_128".to_string()]);
         for n in names {
             let f = module.load_function(&n).with_context(|| format!("kernel {n}"))?;
-            // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB.
+            // gemvn caches nt quantized inputs: 4 x 17408 columns (Qwen3.8-27B ffn_down) need 77 KB. The 96 KB request
+            // exceeds what older GPUs allow (Volta's opt-in is 96 KB *minus the kernel's static shared*), so clamp to the
+            // per-kernel legal maximum: optin - static_shared. A set that still fails is only an upper-bound declaration
+            // and is ignored (launches pass their own shared size).
             if n.starts_with("attn_prefill") || n.starts_with("attn_decode_gqa") || n.starts_with("gemvn") {
-                f.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 96 << 10)?;
+                let optin = ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN).unwrap_or(96 << 10) as usize;
+                let static_sm = f.get_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES).unwrap_or(0) as usize;
+                let max_dyn = (96usize << 10).min(optin.saturating_sub(static_sm));
+                let _ = f.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_dyn as i32);
             }
             fns.insert(n, f);
         }
@@ -253,6 +289,8 @@ impl Gpu {
     /// Whether the prefill GEMM for `ty` runs on int8 tensor cores (X quantized to int8 per 32) rather than f16.
     /// `STRATA_MMQ=q5_k,q6_k,..` overrides the default list.
     pub fn mmq(ty: GgmlType) -> bool {
+        // Volta（sm_70）没有 int8 tensor core，全部量化矩阵乘走 f16 wmma 路径。
+        if cfg!(feature = "nvrtc_12") { return false; }
         // IQ2_XS (and IQ2_S) has a scale per 16: its int8 path spends as long scaling mma results as in the mma, and loses to f16 (#31).
         !Self::float_ty(ty) && std::env::var("STRATA_MMQ").map(|v| v.split(',').any(|t| t == ty.name())).unwrap_or(!matches!(ty, GgmlType::IQ2XS | GgmlType::IQ2S) || llama_numerics())
     }

@@ -6,6 +6,11 @@ typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
 
+#if NVRTC_12
+#include <mma.h>  // Volta（sm_70）tensor core 走 wmma：没有 mma.sync 的 m16n8k16 / ldmatrix
+using namespace nvcuda;
+#endif
+
 __device__ __forceinline__ float h2f(u16 h) { float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
 __device__ __forceinline__ u16 f2h(float f) { u16 h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h; }
 __device__ __forceinline__ u32 ld16(const u8* p) { return *(const u16*)p; }  // 2-aligned only (every quant field is)
@@ -935,6 +940,106 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
             }
 }
 
+#if NVRTC_12
+// Volta（sm_70）没有 mma.sync 的 m16n8k16：改用 wmma 的 16x16x16 f16 tensor core。X/W 的填充沿用 gemm_q，只把 warp 的
+// 内积与写回换成 wmma fragment：每 warp 用 MT×NT16 个 16x16 tile（SM: 1×1 覆盖 16×16；非 SM: 2×2 覆盖 32×32）。
+// 求和顺序与 mma.sync 不同——正常 tensor-core 路径本就允许 f16 近似（--llama-numerics 的 f32 路径不经过这里）。
+template <int T, int SBB, int BM, int BK, bool SM>
+__device__ __forceinline__ void gemm_q_v(const GemmTile* tiles, const u8* wd, int nd, const float* __restrict__ x, int x_stride,
+                                         const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
+    constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 : BM;  // smem pitch in halves
+    constexpr int MT = SM ? 1 : 2, NT16 = SM ? 1 : 2;                          // wmma 16x16 tile 数（行 / 列方向）
+    __shared__ __align__(16) u16 xs[XM * P], ws[64 * P];
+    __shared__ float acc_sm[8][256];  // 每 warp 一块 16x16 写回暂存（写回阶段逐 tile 复用）
+    GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * XM, min(XM, nd - (int)blockIdx.y * XM)};
+    if (tiles && (tl.cnt <= 32) != SM) return;
+    int n0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    int wm = SM ? 16 * (warp & 1) : (warp >> 1) * 32, wn = SM ? 16 * (warp >> 1) : (warp & 1) * 32;
+    const float* xr[XM * BK / 4 / NT];
+    #pragma unroll
+    for (int q = 0; q < XM * BK / 4 / NT; q++) {
+        int r = (tid + q * NT) / (BK / 4);
+        xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
+    }
+    constexpr int WQ = 64 * SUBS / NT;
+    static_assert(64 * SUBS % NT == 0, "whole W groups per thread");
+    uint4 wv[WQ];
+    auto ldw = [&](int kb) {
+        int sb = kb / (256 / BK), part = kb % (256 / BK);
+        #pragma unroll
+        for (int q = 0; q < WQ; q++) {
+            int i = tid + q * NT, r = i / SUBS, j = i % SUBS;
+            float v[8] = {};
+            const u8* blk = tl.w + (size_t)(n0 + r) * ROWB(n64 * 64, SBB) + (size_t)sb * SBB;
+            if (n0 + r >= rows) {
+            } else if constexpr (T == 17 || T == 18 || T == 21 || T == 22) {  // QS tables; same values as deq8
+                int lo, hi; float d, m;
+                QS<T>::get(blk, part * SUBS + j, lo, hi, d, m);
+                for (int e = 0; e < 4; e++) v[e] = d * (float)(signed char)(lo >> 8 * e), v[4 + e] = d * (float)(signed char)(hi >> 8 * e);
+            } else deq8<T>(blk, part * SUBS + j, v);
+            wv[q] = make_uint4(h2pack(v[0], v[1]), h2pack(v[2], v[3]), h2pack(v[4], v[5]), h2pack(v[6], v[7]));
+        }
+    };
+    auto stw = [&]() {
+        #pragma unroll
+        for (int q = 0; q < WQ; q++) { int i = tid + q * NT; *(uint4*)(ws + (i / SUBS) * P + (i % SUBS) * 8) = wv[q]; }
+    };
+    const int nk = n64 * 64 / BK;
+    if constexpr (T == 17 || T == 18 || T == 21 || T == 22) { QS<T>::load(); __syncthreads(); }
+    ldw(0);
+    stw();
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[MT][NT16];
+    #pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+        #pragma unroll
+        for (int nt = 0; nt < NT16; nt++) wmma::fill_fragment(fc[mt][nt], 0.0f);
+    for (int kb = 0; kb < nk; kb++) {
+        #pragma unroll
+        for (int q = 0; q < XM * BK / 4 / NT; q++) {
+            int i = tid + q * NT, r = i / (BK / 4), c = (i % (BK / 4)) * 4;
+            float4 v = xr[q] ? *(const float4*)(xr[q] + kb * BK + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+            *(uint2*)(xs + r * P + c) = make_uint2(h2pack(v.x, v.y), h2pack(v.z, v.w));
+        }
+        __syncthreads();
+        if (kb + 1 < nk) ldw(kb + 1);
+        if (wm < tl.cnt)
+#pragma unroll
+            for (int kk = 0; kk < BK; kk += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa[MT];
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb[NT16];
+                #pragma unroll
+                for (int mt = 0; mt < MT; mt++) wmma::load_matrix_sync(fa[mt], (const half*)(xs + (wm + mt * 16) * P + kk), P);
+                #pragma unroll
+                for (int nt = 0; nt < NT16; nt++) wmma::load_matrix_sync(fb[nt], (const half*)(ws + (wn + nt * 16) * P + kk), P);
+                #pragma unroll
+                for (int mt = 0; mt < MT; mt++)
+                    #pragma unroll
+                    for (int nt = 0; nt < NT16; nt++) wmma::mma_sync(fc[mt][nt], fa[mt], fb[nt], fc[mt][nt]);
+            }
+        __syncthreads();
+        if (kb + 1 < nk) stw();
+    }
+    #pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+        #pragma unroll
+        for (int nt = 0; nt < NT16; nt++) {
+            if (wm >= tl.cnt) continue;
+            wmma::store_matrix_sync(acc_sm[warp], fc[mt][nt], 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = 0; e < 256; e += 32) {
+                int idx = e + lane, r = wm + mt * 16 + idx / 16, n = n0 + wn + nt * 16 + idx % 16;
+                if (r >= tl.cnt || n >= rows) continue;
+                float v = acc_sm[warp][idx];
+                float* yr = y + (size_t)(tl.m0 + r) * y_stride;
+                yr[n] = act == 0 ? v : act == 1 ? silu(yr[n]) * v : yr[n] + v;
+            }
+        }
+}
+#define GEMM_FN gemm_q_v
+#else
+#define GEMM_FN gemm_q
+#endif
+
 #ifndef GEMM_BM
 #define GEMM_BM 128
 #define GEMM_BK 64
@@ -942,11 +1047,11 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK, false>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
+        GEMM_FN<T, SBB, GEMM_BM, GEMM_BK, false>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
     }                                                                                                             \
     extern "C" __global__ void __launch_bounds__(GEMM_BM * 2) gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd, \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act) {  \
-        gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
+        GEMM_FN<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act); \
     }
 QTYPES(DEF_GEMM)
 
@@ -989,6 +1094,7 @@ extern "C" __global__ void quant_q8(const float* x, int x_stride, u8* out, int c
     }
 }
 
+#if !NVRTC_12
 __device__ __forceinline__ void mma_s8_16816(int* c, u32 a0, u32 a1, u32 b0) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
@@ -1011,6 +1117,20 @@ __device__ __forceinline__ void mma_s8_16832_b(int* d, u32 a0, u32 a1, u32 a2, u
 }
 // Weight types whose scale (and min) is constant over 32 weights: one 32-deep mma per scale.
 template <int T> __host__ __device__ constexpr bool scale32() { return T == 42 || T == 2 || T == 3 || T == 6 || T == 7 || T == 8 || T == 12 || T == 13 || T == 16 || T == 19 || T == 18 || T == 21 || T == 23; }
+#endif
+#if NVRTC_12
+// Volta（sm_70）没有 cp.async：退化为同步的 global→shared 拷贝。各调用点的双缓冲与预取语义仍成立（拷贝在调用后立即
+// 完成、写入的是下一个 buffer），只是不再与计算异步重叠。commit/wait 随之变成空操作，正确性由各调用点已有的
+// __syncthreads() 保证。
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
+    *(uint4*)dst = ok ? *(const uint4*)src : make_uint4(0, 0, 0, 0);
+}
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
+    *(uint2*)dst = ok ? *(const uint2*)src : make_uint2(0, 0);
+}
+__device__ __forceinline__ void cp_async_commit() {}
+template <int N> __device__ __forceinline__ void cp_async_wait() {}
+#else
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
     unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
@@ -1021,8 +1141,10 @@ __device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
+#endif
 
 // SM: as in gemm_q (gemmis_*, the tiles of at most 32 positions, 16 x 16 outputs per warp).
+#if !NVRTC_12
 template <int T, int SBB, int BM, bool SM>
 __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int nd, const u8* __restrict__ x,
                                         const int* xrow, float* y, int y_stride, int rows, int n64, int act) {
@@ -1166,6 +1288,7 @@ __device__ __forceinline__ void gemmi_q(const GemmTile* tiles, const u8* wd, int
         gemmi_q<T, SBB, 128, true>(tiles, wd, nd, x, xrow, y, y_stride, rows, n64, act);                        \
     }
 ITYPES(DEF_GEMMI)
+#endif
 
 // ---- elementwise / norm ----
 
@@ -1931,6 +2054,24 @@ extern "C" __global__ void attn_merge(const float* part, const float* qg, float*
 // One warp routes one token: softmax over n logits, top-k (ties to the lower index), renormalized weights. Lane
 // j < k gets the j-th expert's id and weight. The n <= 32 * TOPK_R logits stay in registers (lane holds
 // i = lane + 32 r).
+// Volta（sm_70）没有 __reduce_*_sync（需 sm_80+）：用 __shfl_xor_sync 手做 warp 内 max/min 归约。
+#if NVRTC_12
+__device__ __forceinline__ unsigned redux_max_u32(unsigned v) {
+#pragma unroll
+    for (int o = 16; o; o >>= 1) v = max(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ unsigned redux_min_u32(unsigned v) {
+#pragma unroll
+    for (int o = 16; o; o >>= 1) v = min(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+#define REDUX_MAX(v) redux_max_u32(v)
+#define REDUX_MIN(v) redux_min_u32(v)
+#else
+#define REDUX_MAX(v) __reduce_max_sync(0xffffffff, v)
+#define REDUX_MIN(v) __reduce_min_sync(0xffffffff, v)
+#endif
 #define TOPK_R 16
 __device__ void topk_warp(const float* p, int n, int k, float extra_scale, int lane, int& id, float& w) {
     float v[TOPK_R];
@@ -1955,8 +2096,8 @@ __device__ void topk_warp(const float* p, int n, int k, float extra_scale, int l
             unsigned i = lane + 32 * r, key = __float_as_uint(v[r]) + 1;
             if (i < n && !(taken >> r & 1) && key > bk) { bk = key; bi = i; }
         }
-        unsigned mk = __reduce_max_sync(0xffffffff, bk);
-        bi = __reduce_min_sync(0xffffffff, bk == mk ? bi : 0xffffffffu);
+        unsigned mk = REDUX_MAX(bk);
+        bi = REDUX_MIN(bk == mk ? bi : 0xffffffffu);
         float bv = __uint_as_float(mk - 1);
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (lane == j) { id = bi; mine = bv; }
@@ -2065,6 +2206,7 @@ extern "C" __global__ void moe_combine_seq(float* x, const float* ye, const floa
 __device__ __forceinline__ bool qsa_bit(const unsigned* qm, int mw, int t, int key) {
     return (qm[(size_t)t * mw + (key >> 7)] >> ((key >> 2) & 31)) & 1;
 }
+#if !NVRTC_12
 template <int HD>
 __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
                                                const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) {
@@ -2209,15 +2351,31 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
             }
     }
 }
+#endif
 // --llama-numerics prefill attention: f32 throughout, like llama.cpp's CPU tiled path (the tensor-core kernel above
 // rounds q and the softmax weights to f16). One query at a time per block; slow, for parity runs only.
 template <int HD>
+// f32 prefill attention. This is the fallback the Volta (nvrtc_12) build uses for prefill, and the `--llama-numerics`
+// parity path. It reads the KV cache in whatever format it holds: f16 (`--kv f16`) or q8 (`--kv q8`, KV_Q8), so it must
+// dequantize the latter instead of assuming f16 (a q8 row read as f16 produced NaN/inf).
 __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc, const float* qg, float* out,
                                    const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) {
     constexpr int R = (HD + 127) / 128;
     extern __shared__ __align__(16) u16 fa_sm[];
     float *sq = (float*)fa_sm, *sc = sq + HD;
     int h = blockIdx.y, kvh = h / (nh / nkv), tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    // A KV row (one position of one KV head) is HD f16 halves (`--kv f16`), or HD int8 + HD/16 f16 scales (q8).
+    const size_t krow = KV_Q8 ? (size_t)(HD + HD / 16) : (size_t)HD * 2;
+    const char* kbase = (const char*)kc + (size_t)kvh * krow;
+    const char* vbase = (const char*)vc + (size_t)kvh * krow;
+    auto krd = [&](const char* row, int d) {
+#if KV_Q8
+        float s = h2f(*(const u16*)(row + HD + 2 * (d / 32)));
+        return (float)(signed char)row[d] * s;
+#else
+        return h2f(((const u16*)row)[d]);
+#endif
+    };
     for (int t = blockIdx.x * FA_BQ; t < min(T, blockIdx.x * FA_BQ + FA_BQ); t++) {
         int p = step[0] + t;
         __syncthreads();
@@ -2227,9 +2385,9 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
             int n = min(32, p + 1 - k0);
             __syncthreads();
             for (int j = w; j < n; j += 4) {
-                const u16* kr = kc + ((size_t)(k0 + j) * nkv + kvh) * HD;
+                const char* kr = kbase + (size_t)(k0 + j) * krow;
                 float s = 0.0f;
-                for (int d = lane; d < HD; d += 32) s += sq[d] * h2f(kr[d]);
+                for (int d = lane; d < HD; d += 32) s += sq[d] * krd(kr, d);
                 s = warp_sum(s);
                 if (lane == 0) sc[j] = qm && !qsa_bit(qm, mw, t, k0 + j) ? -INFINITY : s * scale;
             }
@@ -2243,8 +2401,8 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
             for (int j = 0; j < n; j++) {
                 float e = expf(sc[j] - mn);
                 l += e;
-                const u16* vr = vc + ((size_t)(k0 + j) * nkv + kvh) * HD;
-                for (int r = 0; r < R; r++) if (tid + 128 * r < HD) acc[r] += e * h2f(vr[tid + 128 * r]);
+                const char* vr = vbase + (size_t)(k0 + j) * krow;
+                for (int r = 0; r < R; r++) if (tid + 128 * r < HD) acc[r] += e * krd(vr, tid + 128 * r);
             }
             m = mn;
         }
@@ -2255,11 +2413,18 @@ __device__ void attn_prefill_llama(const float* q, const u16* kc, const u16* vc,
         }
     }
 }
+#if NVRTC_12
+// Volta（sm_70）的 tensor-core attn_prefill_t 依赖 ldmatrix 与 mma.sync m16n8k16，Volta 上无法等价实现：改用已有的
+// f32 逐 query 路径（正确，但较慢；decode 仍走完整的 tensor-free 路径）。
+#define FA_FAST(HD, ...) attn_prefill_llama<HD>(__VA_ARGS__)
+#else
+#define FA_FAST(HD, ...) attn_prefill_t<HD>(__VA_ARGS__)
+#endif
 #define DEF_FA(HD) \
     extern "C" __global__ void __launch_bounds__(128) attn_prefill_##HD(const float* q, const u16* kc, const u16* vc, \
             const float* qg, float* out, const int* step, int T, int nh, int nkv, float scale, const unsigned* qm, int mw) { \
         if (LLAMA_Q8) attn_prefill_llama<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw);                   \
-        else attn_prefill_t<HD>(q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw);                               \
+        else FA_FAST(HD, q, kc, vc, qg, out, step, T, nh, nkv, scale, qm, mw);                                       \
     }
 DEF_FA(64) DEF_FA(128) DEF_FA(256)
 
