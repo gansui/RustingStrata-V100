@@ -1,3 +1,8 @@
+# pre-claim
+Code is forked from https://github.com/RustingStudio/RustingStrata.
+makde some modification to support NVCRT 12. it works on Tesla V100，but no optimization for speed and quality.
+Now the code compiled on CUDA 13.0 , driver 580.159.04, nvcc 12.6(V12.6.77).run on debian12
+
 # RustingStrata
 
 A pure-Rust inference engine for the Qwen3.5/3.6 hybrid model family (`qwen35moe`, `qwen35`) in GGUF; Qwen3-Next
